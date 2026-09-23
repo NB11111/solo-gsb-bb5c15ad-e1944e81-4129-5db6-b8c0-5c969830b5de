@@ -5,7 +5,7 @@
 的防栅序号（fencing token）**。续租与释放必须同时校验令牌与防栅序号，旧持有者在
 超时后无法影响新租约；另提供校验接口，供下游判断一次操作是否仍属于当前租约。
 
-每次**申请（含成功与被拒）、续租（单个 / 批量）、释放以及批量申请的逐任务结果**
+每次**申请（含成功与被拒）、续租（单个 / 批量）、交接（成功与被拒）、释放以及批量申请的逐任务结果**
 都会在状态转换的同一个 Lua 脚本内原子写入按任务键分组的 **Redis Stream 审计事件**，事件包含操作结果、
 关联防栅序号与 Redis 服务器时间；通过
 `GET /v1/leases/{task_key}/events?cursor=&limit=` 可游标分页读取（返回
@@ -59,7 +59,8 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 
 ## API
 
-所有端点位于 `/v1` 前缀下，请求与响应均为 JSON。
+所有端点位于 `/v1` 前缀下，请求与响应均为 JSON。除本文档外，也可通过
+Swagger UI 在浏览器中直接查看与调试：<http://localhost:8000/docs>。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -67,6 +68,7 @@ Compose 会同时拉起 Redis 与 API 两个容器，API 等待 Redis 健康检�
 | POST | `/v1/leases/acquire-batch` | 批量申请 2～32 个不重复任务键（统一 TTL），全成全败 |
 | POST | `/v1/leases/renew` | 续租，成功 200 / 失败 409（reason: `not_found` / `conflict` / `expired`） |
 | POST | `/v1/leases/renew-batch` | 批量续租 2～32 个不重复任务键（各自 token / fencing_token，统一 TTL），全成全败、逐项失败原因 |
+| POST | `/v1/leases/transfer` | 当前持有者交接租约：原子更换 token、fencing_token 递增、保留原过期时刻不续期，成功 200 / 失败 409（reason: `not_found` / `conflict` / `expired`） |
 | POST | `/v1/leases/release` | 释放租约（幂等，始终 200） |
 | POST | `/v1/leases/validate` | 校验 (令牌, 防栅序号) 是否仍属当前租约 |
 | GET | `/v1/leases/{task_key}` | 查看任务键租约状态（不暴露令牌） |
@@ -132,21 +134,42 @@ curl -s -X POST localhost:8000/v1/leases/renew-batch \
 # reason 取值与单项续租一致：not_found / conflict / expired。
 # 每个任务的结果（renewed 或失败原因）都原子写入各自的审计 Stream，带 batch_size。
 
-# 5. 下游校验某次操作是否仍属当前租约
+# 5. 交接租约（当前持有者把任务交给新凭据：携带旧 token 与旧 fencing_token）
+curl -s -X POST localhost:8000/v1/leases/transfer \
+  -H 'Content-Type: application/json' \
+  -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1}'
+# 成功 200：服务端生成新 token，防栅序号在原计数器上 +1，
+# expires_at_ms 为【原过期时刻】——交接不续期：
+# => {"transferred":true,"task_key":"report:daily",
+#     "token":"7d91...（服务端生成的新令牌）","fencing_token":2,
+#     "expires_at_ms":1758...}
+#
+# 交接后旧凭据立即失效：用旧 (token, fencing_token) 调
+# renew / release / validate 均按凭据不匹配处理（409 conflict /
+# released=false / valid=false）；新凭据立即可用于这些接口。
+#
+# 失败返回 409 与明确原因，且不改变租约或防栅序号：
+#   not_found —— 租约不存在（从未申请、已释放或过期被回收）
+#   conflict  —— 令牌或防栅序号与当前租约不符（旧持有者 / 并发交接）
+#   expired   —— 租约已过期（残留键尚在但 expires_at 已到）
+# => {"transferred":false,"task_key":"report:daily","token":null,
+#     "fencing_token":2,"expires_at_ms":1758...,"reason":"conflict"}
+
+# 6. 下游校验某次操作是否仍属当前租约
 curl -s -X POST localhost:8000/v1/leases/validate \
   -H 'Content-Type: application/json' \
-  -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1}'
-# => {"valid":true,"remaining_ms":4210}
+  -d '{"task_key": "report:daily", "token": "7d91...", "fencing_token": 2}'
+# => {"valid":true,"remaining_ms":3210}
 
-# 6. 释放租约
+# 7. 释放租约（用交接后的新凭据）
 curl -s -X POST localhost:8000/v1/leases/release \
   -H 'Content-Type: application/json' \
-  -d '{"task_key": "report:daily", "token": "9f3c...", "fencing_token": 1}'
+  -d '{"task_key": "report:daily", "token": "7d91...", "fencing_token": 2}'
 ```
 
 ### 租约审计事件
 
-申请（成功 / 被占用 409）、续租（单个 / 批量）、释放与批量申请都会按**任务键**向对应的
+申请（成功 / 被占用 409）、续租（单个 / 批量）、交接（成功 / 被拒）、释放与批量申请都会按**任务键**向对应的
 Redis Stream 追加一条事件，与租约状态转换在同一个 Lua 脚本中原子提交。
 
 ```bash
@@ -155,17 +178,17 @@ curl -s 'localhost:8000/v1/leases/report:daily/events?limit=20'
 # => {"task_key":"report:daily","events":[
 #   {"id":"1758000000123-0","op":"acquire","result":"acquired",
 #    "fencing_token":1,"time_ms":1758000000123,"batch_size":null},
-#   {"id":"1758000000456-0","op":"renew","result":"renewed",
-#    "fencing_token":1,"time_ms":1758000000456,"batch_size":null},
+#   {"id":"1758000000456-0","op":"transfer","result":"transferred",
+#    "fencing_token":2,"time_ms":1758000000456,"batch_size":null},
 #   {"id":"1758000000789-0","op":"release","result":"released",
-#    "fencing_token":1,"time_ms":1758000000789,"batch_size":null}
+#    "fencing_token":2,"time_ms":1758000000789,"batch_size":null}
 # ],"next_cursor":"1758000000789-0"}
 
 # 用上一次返回的 next_cursor 继续翻页（游标为闭区间尾部，已自动去重）
 curl -s 'localhost:8000/v1/leases/report:daily/events?cursor=1758000000789-0&limit=20'
 # 没有更多事件时 next_cursor 为 null
 
-# 被拒 / 幂等忽略的操作同样落账（续租冲突、释放不匹配等）
+# 被拒 / 幂等忽略的操作同样落账（续租冲突、交接凭据不符 / 已过期 / 不存在、释放不匹配等）
 # 批量申请时每个任务键各自落一条 acquired；冲突批次仅冲突任务落 conflict，
 # 事件带 batch_size 字段（如 3）
 # 批量续租成功时每个任务各落一条 renewed；失败批次仅失败任务按原因落
@@ -177,8 +200,8 @@ curl -s 'localhost:8000/v1/leases/report:daily/events?cursor=1758000000789-0&lim
 | 字段 | 说明 |
 | --- | --- |
 | `id` | Redis Stream 条目 ID（`<毫秒时间>-<序号>`），即分页游标 |
-| `op` | 操作：`acquire` / `acquire_batch` / `renew` / `renew_batch` / `release` |
-| `result` | 操作结果：`acquired` / `conflict` / `renewed` / `not_found` / `expired` / `released` / `ignored` |
+| `op` | 操作：`acquire` / `acquire_batch` / `renew` / `renew_batch` / `transfer` / `release` |
+| `result` | 操作结果：`acquired` / `conflict` / `renewed` / `transferred` / `not_found` / `expired` / `released` / `ignored` |
 | `fencing_token` | 事件关联的防栅序号；租约不存在等无关联场景为 `null` |
 | `time_ms` | 事件落账时刻（Redis 服务器时钟，Unix 毫秒） |
 | `batch_size` | 仅批量申请 / 批量续租事件携带：该批次的任务数量 |
@@ -258,25 +281,37 @@ curl -i -X POST localhost:8000/v1/limits/check \
 
 ## 设计要点
 
-- **原子性**：申请 / 批量申请 / 续租 / 批量续租 / 释放 / 校验全部状态转换均由 Redis
+- **原子性**：申请 / 批量申请 / 续租 / 批量续租 / 交接 / 释放 / 校验全部状态转换均由 Redis
   Lua 脚本（`app/lua.py`）在服务端原子执行，不存在"检查后修改"的竞态窗口。批量申请在
   同一脚本内先检查全部任务、再统一写入，任一任务被占用则整体失败——不创建任何租约，
   也不递增任何防栅计数器（全成全败）；过期租约可被接管。批量续租在同一脚本内基于单次
   服务器 TIME 对全部任务逐项预检，任一租约不存在、凭据不匹配或已过期则整体失败——
   不更新任何 TTL（成功项也不续租），并逐项返回失败原因；全部有效时一次性更新所有 TTL。
+  交接在同一脚本内基于单次服务器 TIME 完成"存在性 → 凭据 → 过期"预检，
+  任一不满足即整体失败，不更换令牌、不递增防栅序号；全部满足时原子 `INCR` 计数器、
+  写入新令牌 / 新防栅序号并按原 `expires_at` 对齐键 TTL，与审计事件同脚本提交。
+- **交接不续期**：`POST /v1/leases/transfer` 只把当前持有者的旧凭据换成服务端生成的
+  新凭据，防栅序号 `+1`，但**保留原 `expires_at` 绝对时刻**（`PEXPIRE` 按剩余毫秒对齐），
+  不延长占用窗口。交接后旧 `(token, fencing_token)` 在续租 / 释放 / 校验接口立即失效，
+  新凭据立即可用；旧持有者迟到的任何请求都不会影响交接后的租约。
+  租约不存在、已过期或凭据不符时返回 `409` 及原因（`not_found` / `expired` / `conflict`），
+  租约与防栅序号均保持不变。
 - **过期判断使用 Redis 服务器时间**：Lua 内通过 `TIME` 命令取 Redis 服务器时钟，
   不依赖各客户端本地时间，避免时钟漂移导致的误判。批量脚本只调用一次 `TIME`，
   整批租约的 `expires_at_ms` 基于同一时刻计算。
 - **防栅序号单调递增**：每个任务键对应一个独立的 `INCR` 计数器键且**永不过期**，
   即使租约键被 TTL 清除，序号也不会回退或复用。下游系统可用它拒绝迟到的旧操作
   （fencing token 经典用法）。
-- **旧持有者隔离**：续租（单个 / 批量）与释放要求令牌和防栅序号**同时**匹配；
-  租约过期后不允许续租（必须重新申请）。因此旧持有者在超时后的任何写操作都不会影响新租约。
+- **旧持有者隔离**：续租（单个 / 批量）、交接与释放要求令牌和防栅序号**同时**匹配；
+  租约过期后不允许续租或交接（必须重新申请）。因此旧持有者在超时后的任何写操作都不会
+  影响新租约；交接完成后旧凭据立即失效，只有递增后的新凭据能继续操作。
 - **双重过期保障**：租约 Hash 内记录 `expires_at`（判断依据），同时设置
   `PEXPIRE`（自动清理残留键）；判断以 `expires_at` 与服务器时间的比较为准。
-- **租约审计流**：申请（成功 / 被拒）、续租（单个 / 批量）、释放与批量申请的
-  逐任务结果，均在状态转换的同一个 Lua 脚本内通过 `XADD` 写入该任务键的审计
-  Stream——操作与事件原子提交，不会出现"操作成功但事件缺失"。批量申请全败时仅被
+- **租约审计流**：申请（成功 / 被拒）、续租（单个 / 批量）、交接（成功 / 被拒）、
+  释放与批量申请的逐任务结果，均在状态转换的同一个 Lua 脚本内通过 `XADD`
+  写入该任务键的审计 Stream——操作与事件原子提交，不会出现"操作成功但事件缺失"。
+  交接失败（不存在 / 凭据不符 / 已过期）同样各落一条 `not_found` / `conflict` /
+  `expired` 且不改变租约；批量申请全败时仅被
   占用的冲突任务各落一条 `conflict`（未冲突任务无任何状态变化，与"不创建不递增"
   一致）；批量续租全败时仅失败任务按原因各落一条（成功项 TTL 未变，不落账），
   全成时每项各落一条 `renewed`。
@@ -336,7 +371,10 @@ python3 scripts/smoke_test.py            # 默认打 http://localhost:8000
 续租/释放/干扰新租约等场景；以及批量申请的全成全败、冲突时不写不递增、
 过期接管与凭据兼容；以及批量续租的全成全败、逐项失败原因（not_found /
 conflict / expired）、失败批次不改变任何 TTL、成功 / 失败结果逐任务写入
-审计 Stream；以及租约审计流：四类操作（含被拒 / 忽略）均按任务键
+审计 Stream；以及租约交接：成功交接原子更换凭据、防栅序号递增、保留原
+过期时刻不续期，旧凭据在续租/释放/校验立即失效、新凭据立即可用，
+not_found / conflict / expired 返回 409 且不改变租约与防栅序号，交接事件
+（含被拒）原子落审计 Stream；以及租约审计流：各类操作（含被拒 / 忽略）均按任务键
 落账、事件字段（op/result/fencing/time_ms/batch_size）正确、游标分页
 （cursor + next_cursor 翻页不重不漏）、非法 cursor 返回 400 / limit
 越界返回 422、按 `LEASE_EVENT_RETENTION` 裁剪最旧事件；以及限流的剩余额度递减、成本加权、超限 429
@@ -361,7 +399,7 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   config.py    # 环境变量配置（pydantic-settings，含审计流保留条数）
-  lua.py       # 申请/批量申请/续租/批量续租/释放/校验六个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 滑动窗口限流（含 request_id 幂等）Lua 脚本
+  lua.py       # 申请/批量申请/续租/批量续租/交接/释放/校验七个租约 Lua 脚本（租约脚本内原子写审计 Stream）+ 滑动窗口限流（含 request_id 幂等）Lua 脚本
   schemas.py   # 请求 / 响应模型（含审计事件分页模型）
   main.py      # FastAPI 应用、路由、Redis 生命周期（含 /events 游标分页）
 scripts/

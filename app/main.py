@@ -25,6 +25,7 @@ from .lua import (
     RELEASE_LUA,
     RENEW_BATCH_LUA,
     RENEW_LUA,
+    TRANSFER_LUA,
     VALIDATE_LUA,
 )
 from .schemas import (
@@ -46,6 +47,8 @@ from .schemas import (
     RenewBatchResponse,
     RenewRequest,
     RenewResponse,
+    TransferRequest,
+    TransferResponse,
     ValidateRequest,
     ValidateResponse,
 )
@@ -63,6 +66,7 @@ async def lifespan(app: FastAPI):
         renew=redis.register_script(RENEW_LUA),
         renew_batch=redis.register_script(RENEW_BATCH_LUA),
         release=redis.register_script(RELEASE_LUA),
+        transfer=redis.register_script(TRANSFER_LUA),
         validate=redis.register_script(VALIDATE_LUA),
         limit_check=redis.register_script(LIMIT_CHECK_LUA),
     )
@@ -72,7 +76,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "供多个工作进程协调独占任务的租约服务，以及基于 Redis Lua 的"
         "原子滑动窗口成本限流（FastAPI + Redis Lua）"
@@ -343,6 +347,58 @@ async def renew_batch(
     return RenewBatchResponse(renewed=False, failures=failures)
 
 
+@app.post(
+    "/v1/leases/transfer",
+    response_model=TransferResponse,
+    responses={
+        status.HTTP_409_CONFLICT: {"model": TransferResponse},
+    },
+)
+async def transfer(
+    req: TransferRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> TransferResponse:
+    """当前持有者交接单个任务租约：原子更换凭据、递增防栅序号、不续期。
+
+    必须同时匹配旧令牌与旧防栅序号，且租约尚未过期（按 Redis 服务器时间）。
+    成功时由服务端生成新令牌，防栅序号在原计数器上递增 1，**保留原过期时刻
+    （不续期）**，返回新凭据与 `expires_at_ms`；交接后旧凭据在续租 / 释放 /
+    校验接口立即失效，新凭据立即可用。
+
+    租约不存在（`not_found`）、令牌或防栅序号不匹配（`conflict`）、
+    租约已过期（`expired`）时返回 **409** 与明确原因，不改变租约或防栅序号。
+    成功交接按现有规则原子写入该任务的审计 Stream。
+    """
+    new_token = uuid.uuid4().hex
+    result = await scripts.transfer(
+        keys=[
+            lease_key(settings, req.task_key),
+            fencing_key(settings, req.task_key),
+            event_stream_key(settings, req.task_key),
+        ],
+        args=[req.token, str(req.fencing_token), new_token, settings.event_retention],
+    )
+    if result[0]:
+        return TransferResponse(
+            transferred=True,
+            task_key=req.task_key,
+            token=new_token,
+            fencing_token=result[1],
+            expires_at_ms=result[2],
+        )
+    _, reason, fencing, expires_at = result
+    response.status_code = status.HTTP_409_CONFLICT
+    return TransferResponse(
+        transferred=False,
+        task_key=req.task_key,
+        fencing_token=fencing or None,
+        expires_at_ms=expires_at or None,
+        reason=reason,
+    )
+
+
 @app.post("/v1/leases/release", response_model=ReleaseResponse)
 async def release(
     req: ReleaseRequest, scripts: ScriptsDep, settings: SettingsDep
@@ -397,9 +453,9 @@ async def list_events(
 ) -> LeaseEventPage:
     """读取任务键的租约审计事件（Redis Stream），按时间升序游标分页。
 
-    事件在申请（成功 / 被拒）、续租（单个 / 批量）、释放与批量申请逐任务
-    落账时，与租约状态转换在同一个 Lua 脚本内原子写入，包含操作结果、
-    防栅序号与 Redis 服务器时间。每个任务键保留最新
+    事件在申请（成功 / 被拒）、续租（单个 / 批量）、交接（成功 / 被拒）、
+    释放与批量申请逐任务落账时，与租约状态转换在同一个 Lua 脚本内原子写入，
+    包含操作结果、防栅序号与 Redis 服务器时间。每个任务键保留最新
     `LEASE_EVENT_RETENTION` 条，超出按最旧事件裁剪。
     """
     if cursor is not None and not _STREAM_ID_PATTERN.match(cursor):
