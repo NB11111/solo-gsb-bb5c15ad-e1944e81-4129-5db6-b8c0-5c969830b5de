@@ -11,10 +11,13 @@
 
 租约审计约定：
 - 每个任务键对应一个 Redis Stream（事件流键），申请（成功 / 被拒）、
-  续租（单个 / 批量）、释放以及批量申请的逐任务结果都在状态转换的同一脚本内
-  XADD 落账，与状态转换原子提交，不可能出现"操作成功但事件丢失"。
-- 条目字段：op（acquire / acquire_batch / renew / renew_batch / release）、
-  result（操作结果）、fencing（相关防栅序号，无则空串）、
+  续租（单个 / 批量）、交接（成功 / 失败）、释放以及批量申请的逐任务结果
+  都在状态转换的同一脚本内 XADD 落账，与状态转换原子提交，不可能出现
+  "操作成功但事件丢失"。
+- 条目字段：op（acquire / acquire_batch / renew / renew_batch /
+  transfer / release）、result（操作结果；交接成功为 transferred，
+  失败为 not_found / conflict / expired）、
+  fencing（相关防栅序号，无则空串）、
   time_ms（Redis 服务器毫秒，与状态判定同一时钟）、
   batch_size（仅批量申请 / 批量续租携带）。
 - retention > 0 时以 XADD MAXLEN 精确裁剪，每个流只保留最新的 retention 条，
@@ -255,6 +258,58 @@ for i = 1, n do
   reply[#reply + 1] = new_expires
 end
 return reply
+"""
+
+# 交接（transfer）：当前持有者把单个任务租约交给新凭据。
+# 必须同时匹配旧令牌与旧防栅序号，且租约尚未过期（判定口径与续租一致：
+# 存在性 -> 凭据 -> 过期）。成功后：
+#   - token 原子替换为服务端生成的新令牌；
+#   - 防栅计数器 INCR 一次（旧序号立即失效，新序号单调递增）；
+#   - expires_at 与键的 PEXPIRE 均保持不变——交接不续期；
+#   - 与上述状态转换同一脚本原子写一条 transferred 审计事件。
+# 失败（not_found / conflict / expired）不改动租约 Hash、不递增防栅计数器，
+# 仅按现有规则落一条对应原因的审计事件。
+# KEYS[1] = 租约键, KEYS[2] = 防栅计数器键, KEYS[3] = 审计事件流键
+# ARGV[1] = 旧令牌, ARGV[2] = 旧 fencing, ARGV[3] = 新令牌
+# ARGV[4] = 事件保留条数
+# 成功返回 {1, 'ok', 新 fencing, expires_at}
+# 失败返回 {0, 原因, 当前 fencing（无则 0）, expires_at（无则 0）}
+TRANSFER_LUA = _AUDIT_LUA + """
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local retention = ARGV[4]
+
+local token = redis.call('HGET', KEYS[1], 'token')
+if not token then
+  audit_add(KEYS[3], retention,
+    {'op', 'transfer', 'result', 'not_found',
+     'fencing', '', 'time_ms', tostring(now)})
+  return {0, 'not_found', 0, 0}
+end
+local current_fencing = redis.call('HGET', KEYS[1], 'fencing')
+if token ~= ARGV[1] or current_fencing ~= ARGV[2] then
+  audit_add(KEYS[3], retention,
+    {'op', 'transfer', 'result', 'conflict',
+     'fencing', current_fencing, 'time_ms', tostring(now)})
+  return {0, 'conflict', tonumber(current_fencing),
+    tonumber(redis.call('HGET', KEYS[1], 'expires_at'))}
+end
+
+local expires_at = tonumber(redis.call('HGET', KEYS[1], 'expires_at'))
+if expires_at <= now then
+  audit_add(KEYS[3], retention,
+    {'op', 'transfer', 'result', 'expired',
+     'fencing', current_fencing, 'time_ms', tostring(now)})
+  return {0, 'expired', tonumber(current_fencing), expires_at}
+end
+
+-- 保留原 expires_at，仅替换 token 并递增防栅序号；不重新 PEXPIRE，交接不续期
+local new_fencing = redis.call('INCR', KEYS[2])
+redis.call('HSET', KEYS[1], 'token', ARGV[3], 'fencing', new_fencing)
+audit_add(KEYS[3], retention,
+  {'op', 'transfer', 'result', 'transferred',
+   'fencing', tostring(new_fencing), 'time_ms', tostring(now)})
+return {1, 'ok', new_fencing, expires_at}
 """
 
 # 释放租约：令牌与防栅序号同时匹配才删除，否则静默忽略。

@@ -178,6 +178,35 @@ class ReleaseRequest(BaseModel):
     fencing_token: int = Field(ge=0)
 
 
+class TransferRequest(BaseModel):
+    task_key: str = Field(
+        min_length=1, max_length=512, examples=["video-transcode:order-123"]
+    )
+    token: str = Field(min_length=1, description="当前持有者的所有权令牌")
+    fencing_token: int = Field(ge=0, description="当前持有者的防栅序号")
+
+
+class TransferResponse(BaseModel):
+    transferred: bool
+    task_key: str
+    token: str | None = Field(
+        default=None, description="服务端生成的新所有权令牌，仅成功时返回"
+    )
+    fencing_token: int | None = Field(
+        default=None, description="交接后递增的新防栅序号，单调递增"
+    )
+    expires_at_ms: int | None = Field(
+        default=None,
+        description=(
+            "过期时间（Redis 服务器时钟，Unix 毫秒）；交接保留原过期时刻，不续期"
+        ),
+    )
+    reason: str | None = Field(
+        default=None,
+        description="失败原因：not_found（租约不存在）/ conflict（令牌或防栅序号不匹配）/ expired（租约已过期）",
+    )
+
+
 class ReleaseResponse(BaseModel):
     released: bool = Field(description="是否真正删除了租约；不匹配时为 false（幂等）")
 
@@ -207,12 +236,16 @@ class LeaseEvent(BaseModel):
 
     id: str = Field(description="Redis Stream 条目 ID（<毫秒时间>-<序号>），即分页游标")
     op: str = Field(
-        description="操作类型：acquire / acquire_batch / renew / renew_batch / release"
+        description=(
+            "操作类型：acquire / acquire_batch / renew / renew_batch / "
+            "transfer / release"
+        )
     )
     result: str = Field(
         description=(
             "操作结果：acquire(_batch) 为 acquired / conflict；"
             "renew(_batch) 为 renewed / not_found / conflict / expired；"
+            "transfer 为 transferred / not_found / conflict / expired；"
             "release 为 released / ignored"
         )
     )

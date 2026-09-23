@@ -7,7 +7,9 @@
 覆盖场景：获取 / 冲突 / 校验 / 续租 / 释放 / 防栅序号单调递增 /
 旧持有者在超时后无法影响新租约，以及批量申请的全成全败、
 冲突时不写不递增、过期接管与凭据兼容，以及批量续租的全成全败、
-逐项失败原因、失败时不改变任何 TTL、审计逐任务落账；
+逐项失败原因、失败时不改变任何 TTL、审计逐任务落账，以及租约交接：
+换新凭据且防栅序号递增、保留原过期时刻不续期、旧凭据立即失效 /
+新凭据立即可用、连续交接、三类 409 不改变租约与防栅序号；
 以及租约审计流：
 四类操作（含被拒 / 忽略）按任务键落账、事件字段正确、
 cursor 分页不重不漏、非法 cursor/limit 拒绝、批量冲突仅冲突方落账、
@@ -156,6 +158,7 @@ def main():
 
     batch_checks()
     renew_batch_checks()
+    transfer_checks()
     audit_checks()
     limit_checks()
 
@@ -394,6 +397,177 @@ def renew_batch_checks():
     code, st2 = call("GET", f"/v1/leases/{k2}")
     check("renew-batch wrong fencing touches no ttl",
           code == 200 and st2["expires_at_ms"] == expires_k2_before, f"{code} {st2}")
+
+
+def transfer_checks():
+    """/v1/leases/transfer：换凭据 / 防栅递增 / 不续期 / 旧凭据失效 / 三类 409 / 审计。"""
+    base = f"smoke-transfer:{int(time.time() * 1000)}"
+    path = "/v1/leases/transfer"
+    key = f"{base}:main"
+
+    def tr(k, token, fence):
+        return call("POST", path,
+                    {"task_key": k, "token": token, "fencing_token": fence})
+
+    # 参数校验：缺 token / 负 fencing -> 422
+    code, _ = call("POST", path, {"task_key": key, "fencing_token": 1})
+    check("transfer missing token -> 422", code == 422, f"code={code}")
+    code, _ = call("POST", path,
+                   {"task_key": key, "token": "t", "fencing_token": -1})
+    check("transfer negative fencing -> 422", code == 422, f"code={code}")
+
+    # not_found：租约不存在 -> 409，不创建租约、不递增防栅计数器
+    code, f = tr(key, "ghost", 1)
+    check("transfer not_found -> 409",
+          code == 409 and not f["transferred"] and f["reason"] == "not_found"
+          and f["token"] is None and f["fencing_token"] is None, f"{code} {f}")
+    code, st = call("GET", f"/v1/leases/{key}")
+    check("transfer not_found created nothing",
+          code == 200 and not st["held"], f"{code} {st}")
+
+    # 准备一个 10 秒租约用于交接
+    code, a = call("POST", "/v1/leases/acquire", {"task_key": key, "ttl_ms": 10_000})
+    check("transfer setup acquire", code == 200 and a["acquired"], f"{code} {a}")
+    token1, fence1, expires1 = a["token"], a["fencing_token"], a["expires_at_ms"]
+
+    # conflict：错误 token / 错误 fencing 各一次，均不改租约、不递增防栅序号
+    code, f = tr(key, "wrong-token", fence1)
+    check("transfer wrong token -> 409 conflict",
+          code == 409 and f["reason"] == "conflict", f"{code} {f}")
+    code, f = tr(key, token1, fence1 + 1)
+    check("transfer wrong fencing -> 409 conflict",
+          code == 409 and f["reason"] == "conflict", f"{code} {f}")
+    code, st = call("GET", f"/v1/leases/{key}")
+    check("transfer conflict touches nothing",
+          code == 200 and st["held"] and st["fencing_token"] == fence1
+          and st["expires_at_ms"] == expires1, f"{code} {st}")
+    # 冲突后原凭据仍可正常续租
+    code, r = call("POST", "/v1/leases/renew",
+                   {"task_key": key, "token": token1,
+                    "fencing_token": fence1, "ttl_ms": 10_000})
+    check("transfer conflict holder still renews",
+          code == 200 and r["renewed"], f"{code} {r}")
+    expires_after_renew = r["expires_at_ms"]
+
+    # 成功交接：新 token 服务端生成、防栅序号 +1、expires_at 原样保留（交接不续期）
+    code, t1 = tr(key, token1, fence1)
+    check("transfer ok",
+          code == 200 and t1["transferred"] and t1["token"]
+          and t1["token"] != token1 and t1["fencing_token"] == fence1 + 1
+          and t1["expires_at_ms"] == expires_after_renew and t1["reason"] is None,
+          f"{code} {t1}")
+    token2, fence2 = t1["token"], t1["fencing_token"]
+
+    # 旧凭据立即在续租 / 释放 / 校验接口失效
+    code, r = call("POST", "/v1/leases/renew",
+                   {"task_key": key, "token": token1,
+                    "fencing_token": fence1, "ttl_ms": 10_000})
+    check("old credential renew rejected after transfer",
+          code == 409 and not r["renewed"] and r["reason"] == "conflict",
+          f"{code} {r}")
+    code, rel = call("POST", "/v1/leases/release",
+                     {"task_key": key, "token": token1, "fencing_token": fence1})
+    check("old credential release ignored after transfer",
+          code == 200 and not rel["released"], f"{code} {rel}")
+    code, v = call("POST", "/v1/leases/validate",
+                   {"task_key": key, "token": token1, "fencing_token": fence1})
+    check("old credential invalid after transfer",
+          code == 200 and not v["valid"], f"{code} {v}")
+    # 用旧凭据再次交接同样 409 conflict，且不得再递增防栅序号
+    code, f = tr(key, token1, fence1)
+    check("old credential transfer rejected",
+          code == 409 and f["reason"] == "conflict"
+          and f["fencing_token"] == fence2, f"{code} {f}")
+
+    # 新凭据立即可用：校验通过、剩余时间与保留的 expires_at 一致
+    code, v = call("POST", "/v1/leases/validate",
+                   {"task_key": key, "token": token2, "fencing_token": fence2})
+    check("new credential valid after transfer",
+          code == 200 and v["valid"] and v["remaining_ms"] > 0, f"{code} {v}")
+    code, st = call("GET", f"/v1/leases/{key}")
+    check("transfer preserved expiry",
+          code == 200 and st["fencing_token"] == fence2
+          and st["expires_at_ms"] == expires_after_renew, f"{code} {st}")
+
+    # 连续交接：第二次成功，序号继续递增、过期时刻仍不变
+    code, t2 = tr(key, token2, fence2)
+    check("second transfer ok",
+          code == 200 and t2["transferred"] and t2["token"] != token2
+          and t2["fencing_token"] == fence2 + 1
+          and t2["expires_at_ms"] == expires_after_renew, f"{code} {t2}")
+    token3, fence3 = t2["token"], t2["fencing_token"]
+    code, v = call("POST", "/v1/leases/validate",
+                   {"task_key": key, "token": token3, "fencing_token": fence3})
+    check("chained new credential valid", code == 200 and v["valid"], f"{code} {v}")
+    # 前一代凭据也已失效
+    code, v = call("POST", "/v1/leases/validate",
+                   {"task_key": key, "token": token2, "fencing_token": fence2})
+    check("previous credential invalid after chained transfer",
+          code == 200 and not v["valid"], f"{code} {v}")
+    # 新凭据可正常续租
+    code, r = call("POST", "/v1/leases/renew",
+                   {"task_key": key, "token": token3,
+                    "fencing_token": fence3, "ttl_ms": 10_000})
+    check("new credential renew ok", code == 200 and r["renewed"], f"{code} {r}")
+    # 新凭据可释放
+    code, rel = call("POST", "/v1/leases/release",
+                     {"task_key": key, "token": token3, "fencing_token": fence3})
+    check("new credential release ok", code == 200 and rel["released"], f"{code} {rel}")
+    # 释放后交接 -> not_found
+    code, f = tr(key, token3, fence3)
+    check("transfer after release -> 409 not_found",
+          code == 409 and f["reason"] == "not_found", f"{code} {f}")
+
+    # expired：短 TTL 租约过期后交接 -> 409（expired/not_found），且不递增防栅序号；
+    # 随后正常接管只递增一次
+    ekey = f"{base}:expired"
+    code, ae = call("POST", "/v1/leases/acquire", {"task_key": ekey, "ttl_ms": 300})
+    check("transfer expired setup", code == 200 and ae["acquired"], f"{code} {ae}")
+    efence = ae["fencing_token"]
+    time.sleep(0.7)
+    code, f = tr(ekey, ae["token"], efence)
+    check("transfer expired -> 409",
+          code == 409 and not f["transferred"]
+          and f["reason"] in ("expired", "not_found"), f"{code} {f}")
+    code, anew = call("POST", "/v1/leases/acquire",
+                      {"task_key": ekey, "ttl_ms": 5000})
+    check("transfer expired no fencing increment",
+          code == 200 and anew["acquired"]
+          and anew["fencing_token"] == efence + 1, f"{code} {anew}")
+
+    # 审计：主任务键的 transfer 事件按时间顺序为
+    # 首次 not_found、两次 conflict(fence1)、transferred(fence2)、
+    # 旧凭据 conflict(fence2)、transferred(fence3)、释放后 not_found
+    code, page = fetch_events(key)
+    t_events = [e for e in page["events"] if e["op"] == "transfer"]
+    check("transfer audit event results",
+          [(e["result"], e["fencing_token"]) for e in t_events] == [
+              ("not_found", None),
+              ("conflict", fence1),
+              ("conflict", fence1),
+              ("transferred", fence2),
+              ("conflict", fence2),
+              ("transferred", fence3),
+              ("not_found", None),
+          ], f"{t_events}")
+    check("transfer audit time ascending",
+          all(t_events[i]["time_ms"] <= t_events[i + 1]["time_ms"]
+              for i in range(len(t_events) - 1)), f"{[e['time_ms'] for e in t_events]}")
+
+    # 不存在键 / 过期键的失败交接也各落一条审计事件
+    gkey = f"{base}:ghost-only"
+    code, _ = tr(gkey, "x", 1)
+    code, page = fetch_events(gkey)
+    g_events = [e for e in page["events"] if e["op"] == "transfer"]
+    check("transfer audit not_found on fresh key",
+          len(g_events) == 1 and g_events[0]["result"] == "not_found"
+          and g_events[0]["fencing_token"] is None, f"{page}")
+    code, page = fetch_events(ekey)
+    e_events = [e for e in page["events"] if e["op"] == "transfer"]
+    check("transfer audit expired event",
+          len(e_events) == 1
+          and e_events[0]["result"] in ("expired", "not_found")
+          and e_events[0]["fencing_token"] in (efence, None), f"{page}")
 
 
 def fetch_events(key, cursor=None, limit=None):

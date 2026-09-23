@@ -25,6 +25,7 @@ from .lua import (
     RELEASE_LUA,
     RENEW_BATCH_LUA,
     RENEW_LUA,
+    TRANSFER_LUA,
     VALIDATE_LUA,
 )
 from .schemas import (
@@ -46,6 +47,8 @@ from .schemas import (
     RenewBatchResponse,
     RenewRequest,
     RenewResponse,
+    TransferRequest,
+    TransferResponse,
     ValidateRequest,
     ValidateResponse,
 )
@@ -62,6 +65,7 @@ async def lifespan(app: FastAPI):
         acquire_batch=redis.register_script(ACQUIRE_BATCH_LUA),
         renew=redis.register_script(RENEW_LUA),
         renew_batch=redis.register_script(RENEW_BATCH_LUA),
+        transfer=redis.register_script(TRANSFER_LUA),
         release=redis.register_script(RELEASE_LUA),
         validate=redis.register_script(VALIDATE_LUA),
         limit_check=redis.register_script(LIMIT_CHECK_LUA),
@@ -72,7 +76,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Lease & Rate Limit API",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "供多个工作进程协调独占任务的租约服务，以及基于 Redis Lua 的"
         "原子滑动窗口成本限流（FastAPI + Redis Lua）"
@@ -341,6 +345,61 @@ async def renew_batch(
     ]
     response.status_code = status.HTTP_409_CONFLICT
     return RenewBatchResponse(renewed=False, failures=failures)
+
+
+@app.post(
+    "/v1/leases/transfer",
+    response_model=TransferResponse,
+    responses={
+        status.HTTP_409_CONFLICT: {"model": TransferResponse},
+    },
+)
+async def transfer(
+    req: TransferRequest,
+    response: Response,
+    scripts: ScriptsDep,
+    settings: SettingsDep,
+) -> TransferResponse:
+    """交接租约：当前持有者把单个任务租约交给服务端签发的新凭据。
+
+    必须同时匹配令牌与防栅序号，且租约尚未过期（按 Redis 服务器时间判定）。
+    成功时原子完成：替换为服务端生成的新 token、防栅序号 INCR 一次，
+    **保留原 expires_at 不续期**，并返回新凭据与 expires_at_ms。
+    此后旧凭据在续租 / 释放 / 校验接口立即失效，新凭据立即可用。
+
+    失败返回 409，reason 取值：not_found / conflict / expired；
+    失败不改动租约、不递增防栅序号。成功交接原子写入该任务的审计 Stream。
+    """
+    new_token = uuid.uuid4().hex
+    ok, _reason, fencing, expires_at = await scripts.transfer(
+        keys=[
+            lease_key(settings, req.task_key),
+            fencing_key(settings, req.task_key),
+            event_stream_key(settings, req.task_key),
+        ],
+        args=[
+            req.token,
+            str(req.fencing_token),
+            new_token,
+            settings.event_retention,
+        ],
+    )
+    if ok:
+        return TransferResponse(
+            transferred=True,
+            task_key=req.task_key,
+            token=new_token,
+            fencing_token=fencing,
+            expires_at_ms=expires_at,
+        )
+    response.status_code = status.HTTP_409_CONFLICT
+    return TransferResponse(
+        transferred=False,
+        task_key=req.task_key,
+        fencing_token=fencing or None,
+        expires_at_ms=expires_at or None,
+        reason=_reason,
+    )
 
 
 @app.post("/v1/leases/release", response_model=ReleaseResponse)
